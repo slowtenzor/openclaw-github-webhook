@@ -2,6 +2,7 @@ import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { emptyPluginConfigSchema } from "openclaw/plugin-sdk";
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { exec as execCb } from "node:child_process";
 
 // --- Types ---
 
@@ -248,8 +249,13 @@ const plugin = {
         logger.info(`[github-webhook] Dispatching: ${event}/${payload.action ?? ""} from ${repoName}`);
 
         // Enqueue as system event into the main agent session
-        // Session key format: agent:accountId (main agent, default account)
         pluginCore!.system.enqueueSystemEvent(text, { sessionKey: "agent:main:main" });
+
+        // Wake the agent so it processes the event immediately
+        execCb("openclaw cron wake --mode now --text 'GitHub webhook event received'", (err) => {
+          if (err) logger.error(`[github-webhook] Wake failed: ${err.message}`);
+          else logger.info(`[github-webhook] Wake sent`);
+        });
       } catch (err: any) {
         logger.error(`[github-webhook] Error: ${err?.message ?? err}`);
         if (!res.headersSent) {
