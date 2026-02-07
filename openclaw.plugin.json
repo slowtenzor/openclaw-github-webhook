@@ -1,0 +1,33 @@
+{
+  "id": "github-webhook",
+  "name": "GitHub Webhook",
+  "description": "Receives GitHub webhook events and dispatches them as system events to the agent session.",
+  "version": "0.1.0",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "secret": {
+        "type": "string",
+        "description": "HMAC SHA-256 webhook secret for signature verification"
+      },
+      "port": {
+        "type": "number",
+        "description": "HTTP port to listen on (default: 9876)"
+      },
+      "path": {
+        "type": "string",
+        "description": "HTTP path to listen on (default: /github-webhook)"
+      },
+      "repos": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Filter: only process events from these repos (owner/name). Empty = all."
+      },
+      "mentionFilter": {
+        "type": "string",
+        "description": "Only dispatch comments that mention this username (e.g. a0a1-aone). Empty = all comments."
+      }
+    }
+  }
+}
