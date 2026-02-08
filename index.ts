@@ -248,13 +248,15 @@ const plugin = {
 
         logger.info(`[github-webhook] Dispatching: ${event}/${payload.action ?? ""} from ${repoName}`);
 
-        // Enqueue as system event into the main agent session
-        pluginCore!.system.enqueueSystemEvent(text, { sessionKey: "agent:main:main" });
-
-        // Wake the agent so it processes the event immediately
-        execCb("openclaw cron wake --mode now --text 'GitHub webhook event received'", (err) => {
-          if (err) logger.error(`[github-webhook] Wake failed: ${err.message}`);
-          else logger.info(`[github-webhook] Wake sent`);
+        // Enqueue system event AND wake the agent immediately
+        execCb(`openclaw system event --text ${JSON.stringify(text)} --mode now`, (err, stdout, stderr) => {
+          if (err) {
+            logger.error(`[github-webhook] system event failed: ${err.message}`);
+            // Fallback: enqueue directly without wake
+            pluginCore!.system.enqueueSystemEvent(text, { sessionKey: "agent:main:main" });
+          } else {
+            logger.info(`[github-webhook] Event dispatched + wake sent`);
+          }
         });
       } catch (err: any) {
         logger.error(`[github-webhook] Error: ${err?.message ?? err}`);
