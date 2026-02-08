@@ -534,6 +534,7 @@ const plugin = {
             message: text,
             name: "github-webhook",
             wakeMode: "now",
+            deliver: false,
           });
 
           const reqOpts: RequestOptions = {
