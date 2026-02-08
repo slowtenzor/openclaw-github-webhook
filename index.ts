@@ -206,13 +206,13 @@ function parseCommandTargets(text: string): { one: boolean; zero: boolean } {
   };
 }
 
-function buildCommandReply(targets: { one: boolean; zero: boolean }): string | null {
-  const lines: string[] = [];
-  if (targets.one) lines.push("aOne: на связи ✅");
-  if (targets.zero) lines.push("aZero: на связи ✅");
-  if (lines.length === 0) return null;
-  lines.push("\n(авто-ответ по webhook-команде)");
-  return lines.join("\n");
+function buildCommandReply(targets: { one: boolean; zero: boolean }, agentName?: string): string | null {
+  // If agentName is set, only respond to matching command
+  if (agentName === "one" && !targets.one) return null;
+  if (agentName === "zero" && !targets.zero) return null;
+
+  const label = agentName === "zero" ? "aZero" : "aOne";
+  return `${label}: на связи ✅`;
 }
 
 // --- Payload formatting ---
@@ -440,7 +440,7 @@ const plugin = {
         if ((event === "discussion_comment" || event === "issue_comment") && action === "created" && !isBotActor(payload)) {
           const commentBody = payload.comment?.body ?? "";
           const targets = parseCommandTargets(commentBody);
-          const reply = buildCommandReply(targets);
+          const reply = buildCommandReply(targets, cfg.agentName);
           if (reply && repoName) {
             try {
               const [owner, repo] = repoName.split("/");

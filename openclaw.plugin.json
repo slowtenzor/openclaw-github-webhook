@@ -39,6 +39,22 @@
       "hooksPath": {
         "type": "string",
         "description": "Base path of the OpenClaw hooks endpoint (default: /hooks)"
+      },
+      "appId": {
+        "type": "number",
+        "description": "GitHub App ID for authentication"
+      },
+      "installationId": {
+        "type": "number",
+        "description": "GitHub App Installation ID"
+      },
+      "pemPath": {
+        "type": "string",
+        "description": "Path to GitHub App private key PEM file"
+      },
+      "agentName": {
+        "type": "string",
+        "description": "Agent identity: 'one' or 'zero'. Only reacts to matching !commands."
       }
     }
   }
