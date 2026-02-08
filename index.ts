@@ -221,6 +221,11 @@ function filterTargetsByMode(
   return targets; // both / default
 }
 
+function extractCommandText(body: string): string {
+  // Strip the !one/!aone/!zero/!azero command prefix and return remaining text
+  return body.replace(/(^|\s)!(aone|one|azero|zero)\b/gi, "").trim();
+}
+
 function buildCommandReply(targets: { one: boolean; zero: boolean }, agentName?: string): string | null {
   // Each agent only responds to its own command
   if (agentName === "one" && !targets.one) return null;
@@ -450,44 +455,71 @@ const plugin = {
 
         logger.info(`[github-webhook] Dispatching: ${event}/${payload.action ?? ""} from ${repoName}`);
 
-        // --- Minimal GitHub reaction (Variant B) ---
-        // Only react on explicit commands !one/!aone/!zero/!azero in newly created comments.
+        // --- Command handling ---
+        // !one/!zero in newly created comments → either ping or full agent turn
         const action = payload.action ?? "";
+        let commandHandled = false;
         if ((event === "discussion_comment" || event === "issue_comment") && action === "created" && !isBotActor(payload)) {
           const commentBody = payload.comment?.body ?? "";
           const mode = cfg.commandMode ?? "both";
           const targets = filterTargetsByMode(parseCommandTargets(commentBody), mode);
-          const reply = buildCommandReply(targets, cfg.agentName);
-          if (reply && repoName) {
-            try {
-              const [owner, repo] = repoName.split("/");
-              const token = await getInstallationToken(cfg, { owner, repo });
 
-              if (event === "discussion_comment") {
-                const discussionNodeId = payload.discussion?.node_id;
-                if (discussionNodeId) {
-                  await postDiscussionComment({ token, discussionNodeId, body: reply });
-                  logger.info("[github-webhook] Posted discussion reaction");
+          // Check if this command is addressed to us
+          const isForMe = (cfg.agentName === "one" && targets.one) ||
+                          (cfg.agentName === "zero" && targets.zero) ||
+                          (!cfg.agentName && (targets.one || targets.zero));
+
+          if (isForMe) {
+            const requestText = extractCommandText(commentBody);
+
+            if (!requestText) {
+              // Pure ping: !one with no additional text → quick "на связи" reply
+              const reply = buildCommandReply(targets, cfg.agentName);
+              if (reply && repoName) {
+                try {
+                  const [owner, repo] = repoName.split("/");
+                  const token = await getInstallationToken(cfg, { owner, repo });
+                  if (event === "discussion_comment") {
+                    const discussionNodeId = payload.discussion?.node_id;
+                    if (discussionNodeId) {
+                      await postDiscussionComment({ token, discussionNodeId, body: reply });
+                      logger.info("[github-webhook] Ping reply posted");
+                    }
+                  }
+                  if (event === "issue_comment") {
+                    const issueNumber = Number(payload.issue?.number);
+                    if (owner && repo && Number.isFinite(issueNumber)) {
+                      await postIssueComment({ token, owner, repo, issueNumber, body: reply });
+                      logger.info("[github-webhook] Ping reply posted");
+                    }
+                  }
+                } catch (e: any) {
+                  logger.error(`[github-webhook] Failed to post ping reply: ${e?.message ?? e}`);
                 }
               }
-
-              if (event === "issue_comment") {
-                const issueNumber = Number(payload.issue?.number);
-                if (owner && repo && Number.isFinite(issueNumber)) {
-                  await postIssueComment({ token, owner, repo, issueNumber, body: reply });
-                  logger.info("[github-webhook] Posted issue/PR reaction");
-                }
-              }
-            } catch (e: any) {
-              logger.error(`[github-webhook] Failed to post GitHub reaction: ${e?.message ?? e}`);
+              commandHandled = true;
+            } else {
+              // Real request: !one <text> → forward to agent for full processing
+              // Agent will respond via GitHub API on its own
+              commandHandled = false; // let it fall through to forwardToAgent below
             }
           }
         }
 
-        // Forward to OpenClaw (optional)
-        // NOTE: When enabled, this will cause the event text to appear in the main session (and thus Telegram).
-        // Default is OFF to keep the pipeline quiet while we validate Variant B (commands-only reactions).
-        if (cfg.forwardToAgent) {
+        // Forward to agent via /hooks/agent
+        // - Always forward if forwardToAgent is enabled
+        // - Also forward when a command with text is addressed to us (even if forwardToAgent is off)
+        const shouldForward = cfg.forwardToAgent || !commandHandled;
+        // But skip if it's a pure ping that was already handled, or not addressed to us
+        const isCommandEvent = (event === "discussion_comment" || event === "issue_comment") && action === "created" && !isBotActor(payload);
+        const commentBody2 = payload.comment?.body ?? "";
+        const targets2 = filterTargetsByMode(parseCommandTargets(commentBody2), cfg.commandMode ?? "both");
+        const isForMe2 = isCommandEvent && ((cfg.agentName === "one" && targets2.one) ||
+                          (cfg.agentName === "zero" && targets2.zero) ||
+                          (!cfg.agentName && (targets2.one || targets2.zero)));
+        const hasRequestText = isForMe2 && !!extractCommandText(commentBody2);
+
+        if (hasRequestText || cfg.forwardToAgent) {
           // Dispatch via /hooks/agent — triggers an active agent turn (not just a passive queue entry)
           const hooksToken = cfg.hooksToken ?? "";
           const hooksPath = cfg.hooksPath ?? "/hooks";
