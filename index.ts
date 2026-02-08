@@ -25,6 +25,12 @@ interface GitHubWebhookConfig {
   // WARNING: this is noisy (it will show up in the main session/Telegram).
   forwardToAgent?: boolean;
 
+  // Command routing to avoid double-replies when multiple agents receive the same webhook.
+  // - "zero": react only to !azero/!zero
+  // - "one":  react only to !aone/!one
+  // - "both": react to both (default)
+  commandMode?: "zero" | "one" | "both";
+
   // Optional overrides for GitHub App auth (defaults are hardcoded for this deployment)
   appId?: number;
   installationId?: number;
@@ -206,13 +212,22 @@ function parseCommandTargets(text: string): { one: boolean; zero: boolean } {
   };
 }
 
-function buildCommandReply(targets: { one: boolean; zero: boolean }, agentName?: string): string | null {
-  // If agentName is set, only respond to matching command
-  if (agentName === "one" && !targets.one) return null;
-  if (agentName === "zero" && !targets.zero) return null;
+function filterTargetsByMode(
+  targets: { one: boolean; zero: boolean },
+  mode: "zero" | "one" | "both" | undefined
+): { one: boolean; zero: boolean } {
+  if (mode === "zero") return { one: false, zero: targets.zero };
+  if (mode === "one") return { one: targets.one, zero: false };
+  return targets; // both / default
+}
 
-  const label = agentName === "zero" ? "aZero" : "aOne";
-  return `${label}: на связи ✅`;
+function buildCommandReply(targets: { one: boolean; zero: boolean }): string | null {
+  const lines: string[] = [];
+  if (targets.one) lines.push("aOne: на связи ✅");
+  if (targets.zero) lines.push("aZero: на связи ✅");
+  if (lines.length === 0) return null;
+  lines.push("\n(авто-ответ по webhook-команде)");
+  return lines.join("\n");
 }
 
 // --- Payload formatting ---
@@ -439,8 +454,9 @@ const plugin = {
         const action = payload.action ?? "";
         if ((event === "discussion_comment" || event === "issue_comment") && action === "created" && !isBotActor(payload)) {
           const commentBody = payload.comment?.body ?? "";
-          const targets = parseCommandTargets(commentBody);
-          const reply = buildCommandReply(targets, cfg.agentName);
+          const mode = cfg.commandMode ?? "both";
+          const targets = filterTargetsByMode(parseCommandTargets(commentBody), mode);
+          const reply = buildCommandReply(targets);
           if (reply && repoName) {
             try {
               const [owner, repo] = repoName.split("/");
