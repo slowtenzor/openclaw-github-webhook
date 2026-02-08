@@ -1,8 +1,7 @@
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { emptyPluginConfigSchema } from "openclaw/plugin-sdk";
 import { createHmac, timingSafeEqual } from "node:crypto";
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { exec as execCb } from "node:child_process";
+import { createServer, request as httpRequest, type IncomingMessage, type ServerResponse, type RequestOptions } from "node:http";
 
 // --- Types ---
 
@@ -11,6 +10,7 @@ interface GitHubWebhookConfig {
   path?: string;
   repos?: string[];
   mentionFilter?: string;
+  hooksPort?: number;
 }
 
 interface PluginCore {
@@ -248,16 +248,53 @@ const plugin = {
 
         logger.info(`[github-webhook] Dispatching: ${event}/${payload.action ?? ""} from ${repoName}`);
 
-        // Enqueue system event AND wake the agent immediately
-        execCb(`openclaw system event --text ${JSON.stringify(text)} --mode now`, (err, stdout, stderr) => {
-          if (err) {
-            logger.error(`[github-webhook] system event failed: ${err.message}`);
-            // Fallback: enqueue directly without wake
-            pluginCore!.system.enqueueSystemEvent(text, { sessionKey: "agent:main:main" });
-          } else {
-            logger.info(`[github-webhook] Event dispatched + wake sent`);
-          }
+        // Dispatch via /hooks/agent — triggers an active agent turn (not just a passive queue entry)
+        const fullCfg = pluginCore?.config.loadConfig() as any;
+        const hooksToken = fullCfg?.hooks?.token ?? "";
+        const hooksPath = fullCfg?.hooks?.path ?? "/hooks";
+        const hooksPort = cfg.hooksPort || fullCfg?.server?.port || 3001;
+
+        if (!hooksToken) {
+          logger.warn("[github-webhook] hooks.token not set in OpenClaw config; falling back to system event");
+          pluginCore!.system.enqueueSystemEvent(text, { sessionKey: "agent:main:main" });
+          return;
+        }
+
+        const postData = JSON.stringify({
+          message: text,
+          name: "github-webhook",
+          wakeMode: "now",
         });
+
+        const reqOpts: RequestOptions = {
+          hostname: "127.0.0.1",
+          port: hooksPort,
+          path: `${hooksPath}/agent`,
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Content-Length": Buffer.byteLength(postData),
+            Authorization: `Bearer ${hooksToken}`,
+          },
+        };
+
+        const agentReq = httpRequest(reqOpts, (agentRes) => {
+          if (agentRes.statusCode === 202) {
+            logger.info("[github-webhook] Agent turn dispatched (202)");
+          } else {
+            logger.error(`[github-webhook] /hooks/agent returned HTTP ${agentRes.statusCode}`);
+            pluginCore!.system.enqueueSystemEvent(text, { sessionKey: "agent:main:main" });
+          }
+          agentRes.resume();
+        });
+
+        agentReq.on("error", (err: Error) => {
+          logger.error(`[github-webhook] /hooks/agent request failed: ${err.message}`);
+          pluginCore!.system.enqueueSystemEvent(text, { sessionKey: "agent:main:main" });
+        });
+
+        agentReq.write(postData);
+        agentReq.end();
       } catch (err: any) {
         logger.error(`[github-webhook] Error: ${err?.message ?? err}`);
         if (!res.headersSent) {

@@ -27,6 +27,10 @@
       "mentionFilter": {
         "type": "string",
         "description": "Only dispatch comments that mention this username (e.g. a0a1-aone). Empty = all comments."
+      },
+      "hooksPort": {
+        "type": "number",
+        "description": "Port of the OpenClaw hooks server (reads from server.port in main config if omitted, default: 3001)"
       }
     }
   }
