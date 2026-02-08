@@ -30,7 +30,15 @@
       },
       "hooksPort": {
         "type": "number",
-        "description": "Port of the OpenClaw hooks server (reads from server.port in main config if omitted, default: 3001)"
+        "description": "Port of the OpenClaw hooks server (default: 3001)"
+      },
+      "hooksToken": {
+        "type": "string",
+        "description": "Token for authenticating with the OpenClaw /hooks/agent endpoint"
+      },
+      "hooksPath": {
+        "type": "string",
+        "description": "Base path of the OpenClaw hooks endpoint (default: /hooks)"
       }
     }
   }

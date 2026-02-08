@@ -1,7 +1,14 @@
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { emptyPluginConfigSchema } from "openclaw/plugin-sdk";
-import { createHmac, timingSafeEqual } from "node:crypto";
-import { createServer, request as httpRequest, type IncomingMessage, type ServerResponse, type RequestOptions } from "node:http";
+import { createHmac, timingSafeEqual, createSign } from "node:crypto";
+import {
+  createServer,
+  request as httpRequest,
+  type IncomingMessage,
+  type ServerResponse,
+  type RequestOptions,
+} from "node:http";
+import { readFileSync } from "node:fs";
 
 // --- Types ---
 
@@ -11,6 +18,17 @@ interface GitHubWebhookConfig {
   repos?: string[];
   mentionFilter?: string;
   hooksPort?: number;
+  hooksToken?: string;
+  hooksPath?: string;
+
+  // If true, forward formatted webhook events into OpenClaw via /hooks/agent.
+  // WARNING: this is noisy (it will show up in the main session/Telegram).
+  forwardToAgent?: boolean;
+
+  // Optional overrides for GitHub App auth (defaults are hardcoded for this deployment)
+  appId?: number;
+  installationId?: number;
+  pemPath?: string;
 }
 
 interface PluginCore {
@@ -27,6 +45,174 @@ function verifySignature(payload: string, signature: string, secret: string): bo
   const actual = signature.slice(7);
   if (expected.length !== actual.length) return false;
   return timingSafeEqual(Buffer.from(expected, "hex"), Buffer.from(actual, "hex"));
+}
+
+// --- GitHub App auth + REST helpers ---
+
+const DEFAULT_APP_ID = 2817294;
+const DEFAULT_INSTALLATION_ID = 108670284;
+const DEFAULT_PEM_PATH = "/home/ubuntu/.openclaw/credentials/a0a1-app.2026-02-07.private-key.pem";
+
+function b64url(input: Buffer | string): string {
+  const buf = typeof input === "string" ? Buffer.from(input) : input;
+  return buf
+    .toString("base64")
+    .replace(/=/g, "")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_");
+}
+
+function jwtRS256(appId: number, pem: string): string {
+  const now = Math.floor(Date.now() / 1000);
+  const header = { alg: "RS256", typ: "JWT" };
+  const payload = { iat: now - 60, exp: now + 540, iss: appId };
+  const h = b64url(JSON.stringify(header));
+  const p = b64url(JSON.stringify(payload));
+  const signingInput = `${h}.${p}`;
+  const signer = createSign("RSA-SHA256");
+  signer.update(signingInput);
+  signer.end();
+  const sig = signer.sign(pem);
+  return `${signingInput}.${b64url(sig)}`;
+}
+
+async function getRepoInstallationId(cfg: GitHubWebhookConfig, owner: string, repo: string): Promise<number> {
+  const appId = cfg.appId ?? DEFAULT_APP_ID;
+  const pemPath = cfg.pemPath ?? DEFAULT_PEM_PATH;
+
+  const pem = readFileSync(pemPath, "utf8");
+  const appJwt = jwtRS256(appId, pem);
+
+  const resp = await fetch(`https://api.github.com/repos/${owner}/${repo}/installation`, {
+    method: "GET",
+    headers: {
+      Authorization: `Bearer ${appJwt}`,
+      Accept: "application/vnd.github+json",
+      "User-Agent": "openclaw-github-webhook",
+    },
+  });
+
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => "");
+    throw new Error(`Failed to resolve installation for ${owner}/${repo}: ${resp.status} ${resp.statusText} ${text}`);
+  }
+
+  const data: any = await resp.json();
+  const installationId = Number(data?.id);
+  if (!Number.isFinite(installationId)) throw new Error("No installation id in /installation response");
+  return installationId;
+}
+
+async function getInstallationToken(cfg: GitHubWebhookConfig, opts?: { owner?: string; repo?: string }): Promise<string> {
+  const appId = cfg.appId ?? DEFAULT_APP_ID;
+  const pemPath = cfg.pemPath ?? DEFAULT_PEM_PATH;
+
+  const pem = readFileSync(pemPath, "utf8");
+  const appJwt = jwtRS256(appId, pem);
+
+  // Prefer per-repo installation id resolution to avoid hardcoding the installation.
+  const owner = opts?.owner;
+  const repo = opts?.repo;
+  const installationId =
+    owner && repo
+      ? await getRepoInstallationId(cfg, owner, repo)
+      : (cfg.installationId ?? DEFAULT_INSTALLATION_ID);
+
+  const resp = await fetch(`https://api.github.com/app/installations/${installationId}/access_tokens`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${appJwt}`,
+      Accept: "application/vnd.github+json",
+      "User-Agent": "openclaw-github-webhook",
+    },
+  });
+
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => "");
+    throw new Error(`Failed to mint installation token: ${resp.status} ${resp.statusText} ${text}`);
+  }
+
+  const data: any = await resp.json();
+  if (!data?.token) throw new Error("No token in installation token response");
+  return data.token as string;
+}
+
+async function postDiscussionComment(params: {
+  token: string;
+  discussionNodeId: string;
+  body: string;
+}): Promise<void> {
+  const { token, discussionNodeId, body } = params;
+  const query = `mutation($discussionId: ID!, $body: String!) {
+    addDiscussionComment(input: { discussionId: $discussionId, body: $body }) {
+      comment { id }
+    }
+  }`;
+  const resp = await fetch("https://api.github.com/graphql", {
+    method: "POST",
+    headers: {
+      Authorization: `bearer ${token}`,
+      "User-Agent": "openclaw-github-webhook",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ query, variables: { discussionId: discussionNodeId, body } }),
+  });
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => "");
+    throw new Error(`Failed to post discussion comment: ${resp.status} ${resp.statusText} ${text}`);
+  }
+  const data: any = await resp.json();
+  if (data.errors?.length) {
+    throw new Error(`GraphQL error: ${JSON.stringify(data.errors)}`);
+  }
+}
+
+async function postIssueComment(params: {
+  token: string;
+  owner: string;
+  repo: string;
+  issueNumber: number;
+  body: string;
+}): Promise<void> {
+  const { token, owner, repo, issueNumber, body } = params;
+  const resp = await fetch(`https://api.github.com/repos/${owner}/${repo}/issues/${issueNumber}/comments`, {
+    method: "POST",
+    headers: {
+      Authorization: `token ${token}`,
+      Accept: "application/vnd.github+json",
+      "User-Agent": "openclaw-github-webhook",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ body }),
+  });
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => "");
+    throw new Error(`Failed to post issue comment: ${resp.status} ${resp.statusText} ${text}`);
+  }
+}
+
+function isBotActor(payload: any): boolean {
+  const sender = payload?.sender;
+  const login = (sender?.login ?? "").toString();
+  const type = (sender?.type ?? "").toString();
+  return type.toLowerCase() === "bot" || /\[bot\]$/i.test(login) || /bot$/i.test(login);
+}
+
+function parseCommandTargets(text: string): { one: boolean; zero: boolean } {
+  const t = (text ?? "").toLowerCase();
+  return {
+    one: /(^|\s)!(aone|one)\b/.test(t),
+    zero: /(^|\s)!(azero|zero)\b/.test(t),
+  };
+}
+
+function buildCommandReply(targets: { one: boolean; zero: boolean }): string | null {
+  const lines: string[] = [];
+  if (targets.one) lines.push("aOne: на связи ✅");
+  if (targets.zero) lines.push("aZero: на связи ✅");
+  if (lines.length === 0) return null;
+  lines.push("\n(авто-ответ по webhook-команде)");
+  return lines.join("\n");
 }
 
 // --- Payload formatting ---
@@ -230,6 +416,15 @@ const plugin = {
           return;
         }
 
+        // Mention filter: only dispatch if mentionFilter user is mentioned in the comment body
+        if (cfg.mentionFilter) {
+          const commentBody = payload.comment?.body ?? payload.review?.body ?? payload.discussion?.body ?? "";
+          if (!commentBody.toLowerCase().includes(`@${cfg.mentionFilter.toLowerCase()}`)) {
+            logger.info(`[github-webhook] Skipping: no mention of @${cfg.mentionFilter}`);
+            return;
+          }
+        }
+
         // Format the event
         const text = formatEvent(event, payload);
         if (!text) {
@@ -237,65 +432,91 @@ const plugin = {
           return;
         }
 
-        // Mention filter: only dispatch if mentionFilter user is mentioned in the comment body
-        if (cfg.mentionFilter) {
-          const commentBody =
-            payload.comment?.body ?? payload.review?.body ?? payload.discussion?.body ?? "";
-          if (!commentBody.toLowerCase().includes(`@${cfg.mentionFilter.toLowerCase()}`)) {
-            logger.info(`[github-webhook] Skipping: no mention of @${cfg.mentionFilter}`);
-            return;
-          }
-        }
-
         logger.info(`[github-webhook] Dispatching: ${event}/${payload.action ?? ""} from ${repoName}`);
 
-        // Dispatch via /hooks/agent — triggers an active agent turn (not just a passive queue entry)
-        const fullCfg = pluginCore?.config.loadConfig() as any;
-        const hooksToken = fullCfg?.hooks?.token ?? "";
-        const hooksPath = fullCfg?.hooks?.path ?? "/hooks";
-        const hooksPort = cfg.hooksPort || fullCfg?.server?.port || 3001;
+        // --- Minimal GitHub reaction (Variant B) ---
+        // Only react on explicit commands !one/!aone/!zero/!azero in newly created comments.
+        const action = payload.action ?? "";
+        if ((event === "discussion_comment" || event === "issue_comment") && action === "created" && !isBotActor(payload)) {
+          const commentBody = payload.comment?.body ?? "";
+          const targets = parseCommandTargets(commentBody);
+          const reply = buildCommandReply(targets);
+          if (reply && repoName) {
+            try {
+              const [owner, repo] = repoName.split("/");
+              const token = await getInstallationToken(cfg, { owner, repo });
 
-        if (!hooksToken) {
-          logger.warn("[github-webhook] hooks.token not set in OpenClaw config; falling back to system event");
-          pluginCore!.system.enqueueSystemEvent(text, { sessionKey: "agent:main:main" });
-          return;
+              if (event === "discussion_comment") {
+                const discussionNodeId = payload.discussion?.node_id;
+                if (discussionNodeId) {
+                  await postDiscussionComment({ token, discussionNodeId, body: reply });
+                  logger.info("[github-webhook] Posted discussion reaction");
+                }
+              }
+
+              if (event === "issue_comment") {
+                const issueNumber = Number(payload.issue?.number);
+                if (owner && repo && Number.isFinite(issueNumber)) {
+                  await postIssueComment({ token, owner, repo, issueNumber, body: reply });
+                  logger.info("[github-webhook] Posted issue/PR reaction");
+                }
+              }
+            } catch (e: any) {
+              logger.error(`[github-webhook] Failed to post GitHub reaction: ${e?.message ?? e}`);
+            }
+          }
         }
 
-        const postData = JSON.stringify({
-          message: text,
-          name: "github-webhook",
-          wakeMode: "now",
-        });
+        // Forward to OpenClaw (optional)
+        // NOTE: When enabled, this will cause the event text to appear in the main session (and thus Telegram).
+        // Default is OFF to keep the pipeline quiet while we validate Variant B (commands-only reactions).
+        if (cfg.forwardToAgent) {
+          // Dispatch via /hooks/agent — triggers an active agent turn (not just a passive queue entry)
+          const hooksToken = cfg.hooksToken ?? "";
+          const hooksPath = cfg.hooksPath ?? "/hooks";
+          const hooksPort = cfg.hooksPort || 3001;
 
-        const reqOpts: RequestOptions = {
-          hostname: "127.0.0.1",
-          port: hooksPort,
-          path: `${hooksPath}/agent`,
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Content-Length": Buffer.byteLength(postData),
-            Authorization: `Bearer ${hooksToken}`,
-          },
-        };
-
-        const agentReq = httpRequest(reqOpts, (agentRes) => {
-          if (agentRes.statusCode === 202) {
-            logger.info("[github-webhook] Agent turn dispatched (202)");
-          } else {
-            logger.error(`[github-webhook] /hooks/agent returned HTTP ${agentRes.statusCode}`);
-            pluginCore!.system.enqueueSystemEvent(text, { sessionKey: "agent:main:main" });
+          if (!hooksToken) {
+            logger.warn("[github-webhook] hooksToken not configured — event dropped");
+            return;
           }
-          agentRes.resume();
-        });
 
-        agentReq.on("error", (err: Error) => {
-          logger.error(`[github-webhook] /hooks/agent request failed: ${err.message}`);
-          pluginCore!.system.enqueueSystemEvent(text, { sessionKey: "agent:main:main" });
-        });
+          const postData = JSON.stringify({
+            message: text,
+            name: "github-webhook",
+            wakeMode: "now",
+          });
 
-        agentReq.write(postData);
-        agentReq.end();
+          const reqOpts: RequestOptions = {
+            hostname: "127.0.0.1",
+            port: hooksPort,
+            path: `${hooksPath}/agent`,
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "Content-Length": Buffer.byteLength(postData),
+              Authorization: `Bearer ${hooksToken}`,
+            },
+          };
+
+          const agentReq = httpRequest(reqOpts, (agentRes) => {
+            if (agentRes.statusCode === 202) {
+              logger.info("[github-webhook] Agent turn dispatched (202)");
+            } else {
+              logger.error(`[github-webhook] /hooks/agent returned HTTP ${agentRes.statusCode}`);
+            }
+            agentRes.resume();
+          });
+
+          agentReq.on("error", (err: Error) => {
+            logger.error(`[github-webhook] /hooks/agent request failed: ${err.message}`);
+          });
+
+          agentReq.write(postData);
+          agentReq.end();
+        } else {
+          logger.info("[github-webhook] forwardToAgent disabled — not forwarding event to OpenClaw");
+        }
       } catch (err: any) {
         logger.error(`[github-webhook] Error: ${err?.message ?? err}`);
         if (!res.headersSent) {
