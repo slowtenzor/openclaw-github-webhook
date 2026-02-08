@@ -40,6 +40,14 @@
         "type": "string",
         "description": "Base path of the OpenClaw hooks endpoint (default: /hooks)"
       },
+      "forwardToAgent": {
+        "type": "boolean",
+        "description": "Forward webhook events to OpenClaw via /hooks/agent (default: false)"
+      },
+      "commandMode": {
+        "type": "string",
+        "description": "Command reaction mode (default: commands-only)"
+      },
       "appId": {
         "type": "number",
         "description": "GitHub App ID for authentication"
