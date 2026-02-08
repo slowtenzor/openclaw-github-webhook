@@ -146,6 +146,7 @@ function readBody(req: IncomingMessage): Promise<string> {
 // --- Plugin ---
 
 let pluginCore: PluginCore | null = null;
+let activeServer: ReturnType<typeof createServer> | null = null;
 
 function getConfig(): GitHubWebhookConfig {
   const cfg = pluginCore?.config.loadConfig() as any;
@@ -304,11 +305,18 @@ const plugin = {
       }
     };
 
+    // Close previous server on re-register (hot-reload)
+    if (activeServer) {
+      activeServer.close();
+      activeServer = null;
+    }
+
     // Start standalone HTTP server
     const port = webhookConfig.port || 9876;
     const server = createServer(handler);
+    activeServer = server;
     server.listen(port, "127.0.0.1", () => {
-      logger.info(`[github-webhook] Listening on http://0.0.0.0:${port}${listenPath}`);
+      logger.info(`[github-webhook] Listening on http://127.0.0.1:${port}${listenPath}`);
     });
     server.on("error", (err: Error) => {
       logger.error(`[github-webhook] Server error: ${err.message}`);
