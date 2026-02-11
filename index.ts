@@ -353,6 +353,9 @@ function readBody(req: IncomingMessage): Promise<string> {
 // --- Plugin ---
 
 let pluginCore: PluginCore | null = null;
+
+// Hot-reload safe singleton: keep one server instance on globalThis to avoid EADDRINUSE.
+const G: any = globalThis as any;
 let activeServer: ReturnType<typeof createServer> | null = null;
 
 function getConfig(): GitHubWebhookConfig {
@@ -471,38 +474,39 @@ const plugin = {
 
           if (isForMe) {
             const requestText = extractCommandText(commentBody);
+            // Always post an immediate ACK via GitHub App so replies never come from a human gh token.
+            // - If it's a pure ping (no requestText): reply is "на связи".
+            // - If it has requestText: reply is "принято" and we forward to agent for the full response.
+            const reply = !requestText
+              ? buildCommandReply(targets, cfg.agentName)
+              : `${cfg.agentName === "zero" ? "aZero" : "aOne"}: принято ✅ (готовлю ответ через GitHub App)`;
 
-            if (!requestText) {
-              // Pure ping: !one with no additional text → quick "на связи" reply
-              const reply = buildCommandReply(targets, cfg.agentName);
-              if (reply && repoName) {
-                try {
-                  const [owner, repo] = repoName.split("/");
-                  const token = await getInstallationToken(cfg, { owner, repo });
-                  if (event === "discussion_comment") {
-                    const discussionNodeId = payload.discussion?.node_id;
-                    if (discussionNodeId) {
-                      await postDiscussionComment({ token, discussionNodeId, body: reply });
-                      logger.info("[github-webhook] Ping reply posted");
-                    }
+            if (reply && repoName) {
+              try {
+                const [owner, repo] = repoName.split("/");
+                const token = await getInstallationToken(cfg, { owner, repo });
+                if (event === "discussion_comment") {
+                  const discussionNodeId = payload.discussion?.node_id;
+                  if (discussionNodeId) {
+                    await postDiscussionComment({ token, discussionNodeId, body: reply });
+                    logger.info("[github-webhook] ACK reply posted");
                   }
-                  if (event === "issue_comment") {
-                    const issueNumber = Number(payload.issue?.number);
-                    if (owner && repo && Number.isFinite(issueNumber)) {
-                      await postIssueComment({ token, owner, repo, issueNumber, body: reply });
-                      logger.info("[github-webhook] Ping reply posted");
-                    }
-                  }
-                } catch (e: any) {
-                  logger.error(`[github-webhook] Failed to post ping reply: ${e?.message ?? e}`);
                 }
+                if (event === "issue_comment") {
+                  const issueNumber = Number(payload.issue?.number);
+                  if (owner && repo && Number.isFinite(issueNumber)) {
+                    await postIssueComment({ token, owner, repo, issueNumber, body: reply });
+                    logger.info("[github-webhook] ACK reply posted");
+                  }
+                }
+              } catch (e: any) {
+                logger.error(`[github-webhook] Failed to post ACK reply: ${e?.message ?? e}`);
               }
-              commandHandled = true;
-            } else {
-              // Real request: !one <text> → forward to agent for full processing
-              // Agent will respond via GitHub API on its own
-              commandHandled = false; // let it fall through to forwardToAgent below
             }
+
+            // If requestText exists, we still forward to agent for the full answer.
+            commandHandled = !requestText;
+          
           }
         }
 
@@ -530,8 +534,38 @@ const plugin = {
             return;
           }
 
+          let forwardMessage = text;
+
+          // If this is a command with payload for us, instruct the agent to post the final answer back to GitHub via GitHub App.
+          if (hasRequestText && isForMe2) {
+            const requestText2 = extractCommandText(commentBody2);
+            const commentUrl = payload.comment?.html_url ?? "";
+            const repoFullName = repoName ?? "";
+            const discussionNumber = payload.discussion?.number;
+            const issueNumber = payload.issue?.number;
+            const pemPath = cfg.pemPath ?? DEFAULT_PEM_PATH;
+
+            const lines: string[] = [
+              "[GitHubCommand]",
+              `agent=${cfg.agentName ?? ""}`,
+              `repo=${repoFullName}`,
+              event === "discussion_comment" ? `discussionNumber=${discussionNumber}` : `issueNumber=${issueNumber}`,
+              `commentUrl=${commentUrl}`,
+              `commandText=${requestText2}`,
+              "",
+              "TASK:",
+              "- Generate a helpful reply.",
+              "- Post the reply back into the same GitHub discussion/issue as a comment.",
+              "- MUST post via GitHub App (installation token + GraphQL addDiscussionComment / REST issue comments).",
+              "- DO NOT use the gh CLI for posting (it will post as a human).",
+              `- GitHub App PEM path: ${pemPath}`,
+            ];
+
+            forwardMessage = lines.join("\n");
+          }
+
           const postData = JSON.stringify({
-            message: text,
+            message: forwardMessage,
             name: "github-webhook",
             wakeMode: "now",
             deliver: false,
@@ -577,8 +611,14 @@ const plugin = {
     };
 
     // Close previous server on re-register (hot-reload)
+    // NOTE: module scope can be recreated; ensure singleton via globalThis.
+    const prev = G.__githubWebhookServer as ReturnType<typeof createServer> | undefined;
+    if (prev) {
+      try { prev.close(); } catch {}
+      G.__githubWebhookServer = undefined;
+    }
     if (activeServer) {
-      activeServer.close();
+      try { activeServer.close(); } catch {}
       activeServer = null;
     }
 
@@ -586,6 +626,7 @@ const plugin = {
     const port = webhookConfig.port || 9876;
     const server = createServer(handler);
     activeServer = server;
+    G.__githubWebhookServer = server;
     server.listen(port, "127.0.0.1", () => {
       logger.info(`[github-webhook] Listening on http://127.0.0.1:${port}${listenPath}`);
     });
